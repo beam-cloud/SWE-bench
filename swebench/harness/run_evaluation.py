@@ -51,6 +51,10 @@ from swebench.harness.modal_eval import (
     run_instances_modal,
     validate_modal_credentials,
 )
+from swebench.harness.beta9_eval import (
+    run_instances_beta9,
+    validate_beta9_credentials,
+)
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.harness.utils import (
     EvaluationError,
@@ -486,6 +490,7 @@ def main(
     namespace: str | None,
     rewrite_reports: bool,
     modal: bool,
+    beta9: bool,
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
     report_dir: str = ".",
@@ -527,6 +532,15 @@ def main(
         else:
             validate_modal_credentials()
             run_instances_modal(predictions, dataset, full_dataset, run_id, timeout)
+        return
+
+    if beta9:
+        # run instances on Beta9
+        if not dataset:
+            print("No instances to run.")
+        else:
+            validate_beta9_credentials()
+            run_instances_beta9(predictions, dataset, full_dataset, run_id, timeout)
         return
 
     # run instances locally
@@ -672,6 +686,9 @@ if __name__ == "__main__":
 
     # Modal execution args
     parser.add_argument("--modal", type=str2bool, default=False, help="Run on Modal")
+
+    # Beta9 execution args
+    parser.add_argument("--beta9", type=str2bool, default=False, help="Run on Beta9")
 
     args = parser.parse_args()
     main(**vars(args))

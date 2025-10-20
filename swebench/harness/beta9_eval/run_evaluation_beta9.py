@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import beta9
-from beta9 import function
-import modal.container_process
-import modal.io_streams
+from beam import Image, function, Sandbox
 import tenacity
 import time
 import traceback
@@ -23,11 +20,9 @@ SANDBOX_ENTRYPOINT = "run_evaluation_beta9_entrypoint"
 LOCAL_SANDBOX_ENTRYPOINT_PATH = (
     Path(__file__).parent / f"{SANDBOX_ENTRYPOINT}.py"
 ).resolve()
-REMOTE_SANDBOX_ENTRYPOINT_PATH = f"/root/{SANDBOX_ENTRYPOINT}.py"
+REMOTE_SANDBOX_ENTRYPOINT_PATH = f"/workspace/{SANDBOX_ENTRYPOINT}.py"
 
-app_name = "swebench-evaluation"
-
-swebench_image = beta9.Image.add_python_packages(["swebench", "tenacity"])
+swebench_image = Image().add_python_packages(["swebench", "tenacity"])
 
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -51,7 +46,7 @@ class TestOutput:
 
 class Beta9SandboxRuntime:
     """
-    Runtime for running instances in a Modal Sandbox.
+    Runtime for running instances in a Beta9 Sandbox.
     """
 
     def __init__(
@@ -61,13 +56,12 @@ class Beta9SandboxRuntime:
         self.image = Beta9SandboxRuntime.get_instance_image(test_spec)
         self.sandbox = self._get_sandbox(timeout)
         self.verbose = verbose
-        self._stream_tasks = []
 
         # Hack for pylint
         self.write_file("/sys/fs/cgroup/cpu/cpu.shares", "2048")
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(7),
+        stop=tenacity.stop_after_attempt(1), # TODO: Increase to 7
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
     )
     def _get_sandbox(self, timeout: int | None = None):
@@ -77,131 +71,100 @@ class Beta9SandboxRuntime:
             # Default 30 minutes
             timeout = 60 * 30
 
-        return modal.Sandbox.create(
-            image=self.image.add_local_file(
-                REMOTE_SANDBOX_ENTRYPOINT_PATH,
-                REMOTE_SANDBOX_ENTRYPOINT_PATH,
-            ),
-            timeout=timeout,
-            cpu=4,
+        # Create sandbox with Beta9 API
+        # Note: timeout is managed at function level, not sandbox level
+        sandbox = Sandbox(image=self.image, cpu=1).create() # TODO: Increase CPU to 4
+
+        # Upload entrypoint script after sandbox creation
+        sandbox.fs.upload_file(
+            str(LOCAL_SANDBOX_ENTRYPOINT_PATH),
+            REMOTE_SANDBOX_ENTRYPOINT_PATH
         )
 
-    async def _read_stream(
-        self, stream: modal.io_streams.StreamReader, output_list: list[str]
-    ):
-        try:
-            async for line in stream:
-                output_list.append(line)
-                if self.verbose:
-                    print(line)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"Error reading stream: {e}")
-
-    async def _read_output(
-        self,
-        p: modal.container_process.ContainerProcess,
-        stdout: list[str],
-        stderr: list[str],
-    ):
-        self._stream_tasks = [
-            asyncio.create_task(self._read_stream(p.stdout, stdout)),
-            asyncio.create_task(self._read_stream(p.stderr, stderr)),
-        ]
-        try:
-            await asyncio.gather(*self._stream_tasks)
-        except asyncio.CancelledError:
-            pass
+        return sandbox
 
     def write_file(self, file_path: str, content: str):
-        self.sandbox.open(file_path, "w").write(content)
+        """Write content to a file in the sandbox using Beta9's file system API."""
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp') as f:
+            f.write(content)
+            temp_path = f.name
+        try:
+            self.sandbox.fs.upload_file(temp_path, file_path)
+        finally:
+            os.unlink(temp_path)
 
     def exec(self, command: str) -> tuple[str, int]:
         """
-        Execute a command in the sandbox.
+        Execute a command in the sandbox using Beta9's process manager.
 
         Returns:
             tuple[str, int]: Sandbox output and return code.
         """
-        p = self.sandbox.exec("python", "-m", SANDBOX_ENTRYPOINT, command)
-        stdout = []
-        stderr = []
-        try:
-            # We separate stdout/stderr because some tests rely on them being separate.
-            # We still read stdout/stderr simultaneously to continuously
-            # flush both streams and avoid blocking.
-            asyncio.run(self._read_output(p, stdout, stderr))
-        except Exception as e:
-            print(f"Error during command execution: {e}")
-        p.wait()
-        return "".join(stdout + stderr), p.returncode
+        # Execute command via Beta9's process manager
+        p = self.sandbox.pm.exec("python", "-m", SANDBOX_ENTRYPOINT, command)
+
+        # Wait for process to complete
+        exit_code = p.wait()
+
+        # Read all output at once using the logs stream
+        output = p.logs.read()
+
+        if self.verbose:
+            print(output)
+
+        return output, exit_code
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._stream_tasks:
-            try:
-                # Forcefully kill remaining streams
-                for task in self._stream_tasks:
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            asyncio.wait_for(task, timeout=0.1)
-                        except asyncio.TimeoutError:
-                            pass
-                        except Exception:
-                            pass
-
-                self.sandbox.terminate()
-            except Exception:
-                pass
-            finally:
-                self._stream_tasks = []
+        """Clean up sandbox resources."""
+        try:
+            self.sandbox.terminate()
+        except Exception:
+            pass
 
     @staticmethod
-    def get_instance_image(test_spec: TestSpec) -> beta9.Image:
+    def get_instance_image(test_spec: TestSpec) -> Image:
         env_script = test_spec.setup_env_script
-        # add trusted host flag for Modal's PyPI mirror
-        env_script = env_script.replace(
-            "conda activate testbed && python -m pip install -r $HOME/requirements.txt",
-            "conda activate testbed && python -m pip install --trusted-host pypi-mirror.modal.local -r $HOME/requirements.txt",
-        )
         repo_script = test_spec.install_repo_script
 
-        remote_env_script_path = "/root/setup_env.sh"
-        remote_repo_script_path = "/root/setup_repo.sh"
+        # Write scripts to local temp files for add_local_path()
+        # Files added via add_local_path() will be in /mnt/code/
+        Path("/tmp/setup_env.sh").write_text(env_script)
+        Path("/tmp/setup_repo.sh").write_text(repo_script)
 
-        Path(remote_env_script_path).write_text(env_script)
-        Path(remote_repo_script_path).write_text(repo_script)
-
-        # Beta9 automatically caches images
+        # Build image with all dependencies using Beta9 API
         return (
-            beta9.Image(python_version="python3.11")
-            .from_registry("ubuntu:22.04")
-            .with_envs({"DEBIAN_FRONTEND": "noninteractive", "TZ": "Etc/UTC"})
-            .add_commands(
-                [
-                    "apt-get update && apt-get install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata",
-                    "wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh",
-                    "bash miniconda.sh -b -p /opt/miniconda3",
-                    "echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc",
-                    "/opt/miniconda3/bin/conda init --all",
-                    "/opt/miniconda3/bin/conda config --append channels conda-forge",
-                    "adduser --disabled-password --gecos 'dog' nonroot",
-                ],
+            Image(
+                python_version="python3.11",
+                base_image="ubuntu:22.04"
             )
-            .add_local_path(
-                Path(remote_env_script_path),
-            )
-            .add_local_path(
-                Path(remote_repo_script_path),
-            )
-            .add_commands(
-                f"chmod +x {remote_env_script_path}",
-                f"/bin/bash -c 'source ~/.bashrc && {remote_env_script_path}'",
-                "echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc",
-                f"/bin/bash {remote_repo_script_path}",
-            )
-            .workdir("/testbed/")
+            .add_local_path("/tmp/setup_env.sh")
+            .add_local_path("/tmp/setup_repo.sh")
+            .add_commands([
+                # Install system packages
+                "apt-get update && apt-get install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata",
+                # Install miniconda
+                "wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O /tmp/miniconda.sh",
+                "bash /tmp/miniconda.sh -b -p /opt/miniconda3",
+                "echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc",
+                "/opt/miniconda3/bin/conda init --all",
+                "/opt/miniconda3/bin/conda config --append channels conda-forge",
+                # Add user
+                "adduser --disabled-password --gecos 'dog' nonroot",
+                # Copy scripts from /mnt/code/ to /workspace/ and make executable
+                "cp /mnt/code/setup_env.sh /workspace/setup_env.sh",
+                "cp /mnt/code/setup_repo.sh /workspace/setup_repo.sh",
+                "chmod +x /workspace/setup_env.sh",
+                "chmod +x /workspace/setup_repo.sh",
+                # Run env setup script
+                "/bin/bash -c 'source ~/.bashrc && /workspace/setup_env.sh'",
+                # Configure conda activation
+                "echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /workspace/.bashrc",
+                # Run repo setup script
+                "/bin/bash /workspace/setup_repo.sh",
+            ])
         )
 
 
@@ -213,10 +176,8 @@ def get_log_dir(pred: dict, run_id: str, instance_id: str) -> Path:
 
 
 @function(
-    name=app_name,
     image=swebench_image,
-    timeout=120
-    * 60,  # Much larger than default timeout to account for image build time
+    timeout=120 * 60,  # Much larger than default timeout to account for image build time
 )
 def run_instance_beta9(
     test_spec: TestSpec,
@@ -286,7 +247,7 @@ def run_instance_beta9(
         )
         logger.info(f"Git diff before:\n{git_diff_output_before}")
 
-        eval_file = "/root/eval.sh"
+        eval_file = "/workspace/eval.sh"
         eval_script = test_spec.eval_script
         # django hack
         eval_script = eval_script.replace("locale-gen", "locale-gen en_US.UTF-8")
@@ -301,7 +262,7 @@ def run_instance_beta9(
         # increase recursion limit for testing
         run_command += " && python3 -c 'import sys; sys.setrecursionlimit(10000)'"
         # run eval script
-        run_command += " && /bin/bash /root/eval.sh"
+        run_command += " && /bin/bash /workspace/eval.sh"
         test_output, returncode = runner.exec(run_command)
 
         total_runtime = time.time() - start_time
@@ -343,12 +304,6 @@ def run_instance_beta9(
             log_dir=log_dir,
             errored=False,
         )
-    except beta9.exception.SandboxTimeoutError as e:
-        raise EvaluationError(
-            instance_id,
-            f"Test timed out after {timeout} seconds.",
-            logger,
-        ) from e
     except EvaluationError:
         error_msg = traceback.format_exc()
         logger.info(error_msg)
@@ -397,54 +352,57 @@ def run_instances_beta9(
     """
     test_specs = list(map(make_test_spec, instances))
 
-    with beta9.enable_output():
-        with app.run():
-            run_test_specs = []
+    run_test_specs = []
 
-            # Check for instances that have already been run
-            for test_spec in test_specs:
-                log_dir = get_log_dir(
-                    predictions[test_spec.instance_id], run_id, test_spec.instance_id
-                )
-                if log_dir.exists():
-                    continue
-                run_test_specs.append(test_spec)
+    # Check for instances that have already been run
+    for test_spec in test_specs:
+        log_dir = get_log_dir(
+            predictions[test_spec.instance_id], run_id, test_spec.instance_id
+        )
+        if log_dir.exists():
+            continue
+        run_test_specs.append(test_spec)
 
-            if run_test_specs:
-                # Run instances that haven't been run yet
-                results = run_instance_beta9.map(
-                    [
-                        (
-                            test_spec,
-                            predictions[test_spec.instance_id],
-                            run_id,
-                            timeout,
-                        )
-                        for test_spec in run_test_specs
-                    ],
-                    return_exceptions=True,
-                )
+    if run_test_specs:
+        # Prepare argument tuples for mapping
+        args_list = [
+            (
+                test_spec,
+                predictions[test_spec.instance_id],
+                run_id,
+                timeout,
+            )
+            for test_spec in run_test_specs
+        ]
 
-                for result in results:
-                    if not isinstance(result, TestOutput):
-                        print(f"Result failed with error: {result}")
-                        continue
+        # Run instances that haven't been run yet
+        # Beta9's .map() takes an iterable and passes each element to the function
+        results = list(run_instance_beta9.map(args_list))
 
-                    # Save logs locally
-                    log_dir = result.log_dir
-                    log_dir.mkdir(parents=True, exist_ok=True)
-                    with open(log_dir / "run_instance.log", "w") as f:
-                        f.write(result.run_instance_log)
-                    with open(log_dir / "test_output.txt", "w") as f:
-                        f.write(result.test_output)
-                    with open(log_dir / "patch.diff", "w") as f:
-                        f.write(result.patch_diff)
-                    with open(log_dir / "report.json", "w") as f:
-                        try:
-                            report_json = json.loads(result.report_json_str)
-                            json.dump(report_json, f, indent=4)
-                        except Exception:
-                            # This happens if the test fails with any exception
-                            print(f"{result.instance_id}: no report.json")
+        for result in results:
+            if result is None or isinstance(result, Exception):
+                print(f"Result failed with error: {result}")
+                continue
 
-            make_run_report(predictions, full_dataset, run_id)
+            if not isinstance(result, TestOutput):
+                print(f"Unexpected result type: {type(result)}")
+                continue
+
+            # Save logs locally
+            log_dir = result.log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "run_instance.log", "w") as f:
+                f.write(result.run_instance_log)
+            with open(log_dir / "test_output.txt", "w") as f:
+                f.write(result.test_output)
+            with open(log_dir / "patch.diff", "w") as f:
+                f.write(result.patch_diff)
+            with open(log_dir / "report.json", "w") as f:
+                try:
+                    report_json = json.loads(result.report_json_str)
+                    json.dump(report_json, f, indent=4)
+                except Exception:
+                    # This happens if the test fails with any exception
+                    print(f"{result.instance_id}: no report.json")
+
+    make_run_report(predictions, full_dataset, run_id)
