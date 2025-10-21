@@ -140,7 +140,10 @@ class Beta9SandboxRuntime:
         # Create sandbox with Beta9 API
         # Note: timeout is managed at function level, not sandbox level
         print(f"[Beta9] Calling Sandbox.create() with cpu=1...")
-        sandbox = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1).create() # TODO: Increase CPU to 4
+        sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1)
+        sb.image.ignore_python = False
+        
+        sandbox = sb.create() # TODO: Increase CPU to 4
         print(f"[Beta9] Sandbox.create() completed")
 
         # Upload entrypoint script after sandbox creation
@@ -176,7 +179,7 @@ class Beta9SandboxRuntime:
         # Execute command via Beta9's process manager
         if self.verbose:
             print(f"[Beta9] Executing command: {command[:100]}...")
-        p = self.sandbox.process.exec("/opt/miniconda3/bin/python", "-m", SANDBOX_ENTRYPOINT, command) # TODO: Use python3 instead of the full path
+        p = self.sandbox.process.exec("python3", "-m", SANDBOX_ENTRYPOINT, command) # TODO: Use python3 instead of the full path
 
         # Wait for process to complete
         if self.verbose:
