@@ -52,13 +52,79 @@ class Beta9SandboxRuntime:
     def __init__(
         self, test_spec: TestSpec, timeout: int | None = None, verbose: bool = True
     ):
+        print(f"[Beta9] Initializing sandbox for {test_spec.instance_id}...")
         self.test_spec = test_spec
-        self.image = Beta9SandboxRuntime.get_instance_image(test_spec)
-        self.sandbox = self._get_sandbox(timeout)
         self.verbose = verbose
 
+        print(f"[Beta9] Building image for {test_spec.instance_id}...")
+        self.image = Beta9SandboxRuntime.get_instance_image(test_spec)
+        print(f"[Beta9] Image built successfully")
+
+        print(f"[Beta9] Creating sandbox...")
+        self.sandbox = self._get_sandbox(timeout)
+        print(f"[Beta9] Sandbox created successfully")
+
+        # Upload and execute setup scripts
+        import tempfile
+        import os
+
+        # Upload env setup script
+        print(f"[Beta9] Uploading environment setup script...")
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as f:
+            f.write(test_spec.setup_env_script)
+            env_script_path = f.name
+        self.sandbox.fs.upload_file(env_script_path, "/workspace/setup_env.sh")
+        os.unlink(env_script_path)
+        print(f"[Beta9] Environment setup script uploaded")
+
+        # Upload repo setup script
+        print(f"[Beta9] Uploading repository setup script...")
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as f:
+            f.write(test_spec.install_repo_script)
+            repo_script_path = f.name
+        self.sandbox.fs.upload_file(repo_script_path, "/workspace/setup_repo.sh")
+        os.unlink(repo_script_path)
+        print(f"[Beta9] Repository setup script uploaded")
+
+        # Make scripts executable and run them
+        print(f"[Beta9] Making scripts executable...")
+        self.exec("chmod +x /workspace/setup_env.sh")
+        self.exec("chmod +x /workspace/setup_repo.sh")
+        print(f"[Beta9] Scripts are now executable")
+
+        # Run env setup script
+        print(f"[Beta9] Running environment setup script (this may take a while)...")
+        output, returncode = self.exec("/bin/bash -c 'source ~/.bashrc && /workspace/setup_env.sh'")
+        if returncode != 0:
+            print(f"[Beta9] Warning: env setup script failed with code {returncode}")
+            if self.verbose:
+                print(output)
+        else:
+            print(f"[Beta9] Environment setup script completed successfully")
+
+        # Configure conda activation
+        print(f"[Beta9] Configuring conda activation...")
+        self.exec("echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /workspace/.bashrc")
+        print(f"[Beta9] Conda activation configured")
+
+        # Run repo setup script
+        print(f"[Beta9] Running repository setup script (this may take a while)...")
+        output, returncode = self.exec("/bin/bash /workspace/setup_repo.sh")
+        if returncode != 0:
+            print(f"[Beta9] Warning: repo setup script failed with code {returncode}")
+            if self.verbose:
+                print(output)
+        else:
+            print(f"[Beta9] Repository setup script completed successfully")
+
         # Hack for pylint
-        self.write_file("/sys/fs/cgroup/cpu/cpu.shares", "2048")
+        print(f"[Beta9] Applying pylint hack...")
+        try:
+            self.write_file("/sys/fs/cgroup/cpu/cpu.shares", "2048")
+        except Exception as e:
+            # This file may not be writable in Beta9 sandboxes, which is okay
+            print(f"[Beta9] Warning: Could not write to /sys/fs/cgroup/cpu/cpu.shares: {e}")
+        print(f"[Beta9] Sandbox initialization complete for {test_spec.instance_id}")
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(1), # TODO: Increase to 7
@@ -73,13 +139,17 @@ class Beta9SandboxRuntime:
 
         # Create sandbox with Beta9 API
         # Note: timeout is managed at function level, not sandbox level
-        sandbox = Sandbox(image=self.image, cpu=1).create() # TODO: Increase CPU to 4
+        print(f"[Beta9] Calling Sandbox.create() with cpu=1...")
+        sandbox = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1).create() # TODO: Increase CPU to 4
+        print(f"[Beta9] Sandbox.create() completed")
 
         # Upload entrypoint script after sandbox creation
+        print(f"[Beta9] Uploading entrypoint script...")
         sandbox.fs.upload_file(
             str(LOCAL_SANDBOX_ENTRYPOINT_PATH),
             REMOTE_SANDBOX_ENTRYPOINT_PATH
         )
+        print(f"[Beta9] Entrypoint script uploaded")
 
         return sandbox
 
@@ -104,16 +174,22 @@ class Beta9SandboxRuntime:
             tuple[str, int]: Sandbox output and return code.
         """
         # Execute command via Beta9's process manager
-        p = self.sandbox.pm.exec("python", "-m", SANDBOX_ENTRYPOINT, command)
+        if self.verbose:
+            print(f"[Beta9] Executing command: {command[:100]}...")
+        p = self.sandbox.process.exec("/opt/miniconda3/bin/python", "-m", SANDBOX_ENTRYPOINT, command) # TODO: Use python3 instead of the full path
 
         # Wait for process to complete
+        if self.verbose:
+            print(f"[Beta9] Waiting for command to complete...")
         exit_code = p.wait()
 
         # Read all output at once using the logs stream
         output = p.logs.read()
 
         if self.verbose:
-            print(output)
+            print(f"[Beta9] Command completed with exit code: {exit_code}")
+            if output:
+                print(output)
 
         return output, exit_code
 
@@ -126,22 +202,13 @@ class Beta9SandboxRuntime:
 
     @staticmethod
     def get_instance_image(test_spec: TestSpec) -> Image:
-        env_script = test_spec.setup_env_script
-        repo_script = test_spec.install_repo_script
-
-        # Write scripts to local temp files for add_local_path()
-        # Files added via add_local_path() will be in /mnt/code/
-        Path("/tmp/setup_env.sh").write_text(env_script)
-        Path("/tmp/setup_repo.sh").write_text(repo_script)
-
-        # Build image with all dependencies using Beta9 API
+        # Build shared base image with dependencies (no instance-specific scripts)
+        # Scripts will be uploaded to sandbox after creation
         return (
             Image(
                 python_version="python3.11",
                 base_image="ubuntu:22.04"
             )
-            .add_local_path("/tmp/setup_env.sh")
-            .add_local_path("/tmp/setup_repo.sh")
             .add_commands([
                 # Install system packages
                 "apt-get update && apt-get install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata",
@@ -153,17 +220,6 @@ class Beta9SandboxRuntime:
                 "/opt/miniconda3/bin/conda config --append channels conda-forge",
                 # Add user
                 "adduser --disabled-password --gecos 'dog' nonroot",
-                # Copy scripts from /mnt/code/ to /workspace/ and make executable
-                "cp /mnt/code/setup_env.sh /workspace/setup_env.sh",
-                "cp /mnt/code/setup_repo.sh /workspace/setup_repo.sh",
-                "chmod +x /workspace/setup_env.sh",
-                "chmod +x /workspace/setup_repo.sh",
-                # Run env setup script
-                "/bin/bash -c 'source ~/.bashrc && /workspace/setup_env.sh'",
-                # Configure conda activation
-                "echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /workspace/.bashrc",
-                # Run repo setup script
-                "/bin/bash /workspace/setup_repo.sh",
             ])
         )
 
@@ -195,6 +251,10 @@ def run_instance_beta9(
         timeout (int): Timeout for running tests
     """
     instance_id = test_spec.instance_id
+    print(f"\n{'='*80}")
+    print(f"[Beta9] Starting evaluation for {instance_id}")
+    print(f"{'='*80}\n")
+
     log_dir = get_log_dir(pred, run_id, instance_id)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -203,6 +263,7 @@ def run_instance_beta9(
     logger = setup_logger(instance_id, log_file, add_stdout=True)
 
     try:
+        print(f"[Beta9] Creating sandbox runtime for {instance_id}...")
         runner = Beta9SandboxRuntime(test_spec, timeout)
     except Exception as e:
         print(f"Error creating sandbox: {e}")
@@ -215,6 +276,7 @@ def run_instance_beta9(
     patch_diff = pred.get("model_patch", "")
 
     try:
+        print(f"[Beta9] Applying patch for {instance_id}...")
         patch_file = "/tmp/patch.diff"
         runner.write_file(patch_file, patch_diff)
 
@@ -253,6 +315,7 @@ def run_instance_beta9(
         eval_script = eval_script.replace("locale-gen", "locale-gen en_US.UTF-8")
         runner.write_file(eval_file, eval_script)
 
+        print(f"[Beta9] Running tests for {instance_id} (this may take several minutes)...")
         start_time = time.time()
 
         run_command = "cd /testbed"
@@ -264,6 +327,7 @@ def run_instance_beta9(
         # run eval script
         run_command += " && /bin/bash /workspace/eval.sh"
         test_output, returncode = runner.exec(run_command)
+        print(f"[Beta9] Tests completed for {instance_id}")
 
         total_runtime = time.time() - start_time
 
@@ -283,6 +347,7 @@ def run_instance_beta9(
             logger.info("Git diff changed after running eval script")
 
         # Get report from test output
+        print(f"[Beta9] Grading results for {instance_id}...")
         logger.info(f"Grading answer for {instance_id}...")
         report = get_eval_report(
             test_spec=test_spec,
@@ -294,6 +359,9 @@ def run_instance_beta9(
             f"report: {report}\n"
             f"Result for {instance_id}: resolved: {report[instance_id]['resolved']}"
         )
+
+        print(f"[Beta9] ✓ Evaluation completed for {instance_id} - resolved: {report[instance_id]['resolved']}")
+        print(f"{'='*80}\n")
 
         return TestOutput(
             instance_id=instance_id,
@@ -307,6 +375,8 @@ def run_instance_beta9(
     except EvaluationError:
         error_msg = traceback.format_exc()
         logger.info(error_msg)
+        print(f"[Beta9] ✗ Evaluation error for {instance_id}")
+        print(f"{'='*80}\n")
         return TestOutput(
             instance_id=instance_id,
             test_output="",
@@ -323,6 +393,8 @@ def run_instance_beta9(
             f"Check ({logger.log_file}) for more information."
         )
         logger.error(error_msg)
+        print(f"[Beta9] ✗ Exception occurred for {instance_id}: {e}")
+        print(f"{'='*80}\n")
         return TestOutput(
             instance_id=instance_id,
             test_output="",
@@ -350,6 +422,9 @@ def run_instances_beta9(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
     """
+    print(f"\n[Beta9] Starting Beta9 evaluation run: {run_id}")
+    print(f"[Beta9] Total instances in dataset: {len(instances)}")
+
     test_specs = list(map(make_test_spec, instances))
 
     run_test_specs = []
@@ -363,6 +438,9 @@ def run_instances_beta9(
             continue
         run_test_specs.append(test_spec)
 
+    print(f"[Beta9] Instances already completed: {len(test_specs) - len(run_test_specs)}")
+    print(f"[Beta9] Instances to run: {len(run_test_specs)}")
+
     if run_test_specs:
         # Prepare argument tuples for mapping
         args_list = [
@@ -375,9 +453,13 @@ def run_instances_beta9(
             for test_spec in run_test_specs
         ]
 
+        print(f"[Beta9] Dispatching {len(args_list)} instances to Beta9 workers...\n")
+
         # Run instances that haven't been run yet
         # Beta9's .map() takes an iterable and passes each element to the function
         results = list(run_instance_beta9.map(args_list))
+
+        print(f"\n[Beta9] All {len(results)} instances completed, processing results...")
 
         for result in results:
             if result is None or isinstance(result, Exception):
@@ -405,4 +487,6 @@ def run_instances_beta9(
                     # This happens if the test fails with any exception
                     print(f"{result.instance_id}: no report.json")
 
+    print(f"\n[Beta9] Generating final evaluation report...")
     make_run_report(predictions, full_dataset, run_id)
+    print(f"[Beta9] Evaluation run complete: {run_id}\n")
