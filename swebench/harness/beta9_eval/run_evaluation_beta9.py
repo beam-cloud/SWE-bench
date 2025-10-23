@@ -24,6 +24,8 @@ REMOTE_SANDBOX_ENTRYPOINT_PATH = f"/workspace/{SANDBOX_ENTRYPOINT}.py"
 
 swebench_image = Image().add_python_packages(["swebench", "tenacity"])
 
+SANDBOX_TIMEOUT = 60 * 30
+
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
     APPLY_PATCH_PASS,
@@ -98,7 +100,7 @@ class Beta9SandboxRuntime:
                 print(output)
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(1), # TODO: Increase to 7
+        stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
     )
     def _get_sandbox(self, timeout: int | None = None):
@@ -106,12 +108,12 @@ class Beta9SandboxRuntime:
         # so we retry a few times.
         if timeout is None:
             # Default 30 minutes
-            timeout = 60 * 30
+            timeout = SANDBOX_TIMEOUT
 
         sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1)
         sb.image.ignore_python = False
 
-        sandbox = sb.create() # TODO: Increase CPU to 4
+        sandbox = sb.create()
 
         sandbox.fs.upload_file(
             str(LOCAL_SANDBOX_ENTRYPOINT_PATH),
@@ -436,8 +438,7 @@ def run_instances_beta9(
                 try:
                     report_json = json.loads(result.report_json_str)
                     json.dump(report_json, f, indent=4)
-                except Exception:
-                    # This happens if the test fails with any exception
+                except json.JSONDecodeError:
                     print(f"{result.instance_id}: no report.json")
 
     make_run_report(predictions, full_dataset, run_id)
