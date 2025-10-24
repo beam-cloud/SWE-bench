@@ -57,3 +57,14 @@ This will execute the evaluation harness on Modal's cloud infrastructure, elimin
 
 > [!NOTE]
 > Modal for SWE-bench Multimodal is currently experimental and may not be fully supported yet.
+
+### 🌩️ Evaluation with Beta9
+You can also run evaluations entirely on the cloud using [Beam](https://beam.cloud/) to avoid local setup and resource constraints:
+```bash
+python -m swebench.harness.run_evaluation \
+    --predictions_path gold \
+    --run_id validate-gold-modal \
+    --instance_ids sympy__sympy-20590 \
+    --beta9 true
+```
+This will execute the evaluation harness on Beam's cloud infrastructure, eliminating the need for local Docker setup and resource management.
