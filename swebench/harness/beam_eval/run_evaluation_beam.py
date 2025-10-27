@@ -22,7 +22,7 @@ LOCAL_SANDBOX_ENTRYPOINT_PATH = (
 ).resolve()
 REMOTE_SANDBOX_ENTRYPOINT_PATH = f"/workspace/{SANDBOX_ENTRYPOINT}.py"
 
-swebench_image = Image().add_python_packages(["swebench", "tenacity"])
+swebench_image = Image().add_python_packages(["beam-client>=0.2.189", "swebench", "tenacity"])
 
 SANDBOX_TIMEOUT = 60 * 30
 
@@ -111,7 +111,6 @@ class BeamSandboxRuntime:
             timeout = SANDBOX_TIMEOUT
 
         sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=6)
-        sb.image.ignore_python = False
 
         sandbox = sb.create()
 
@@ -174,10 +173,7 @@ class BeamSandboxRuntime:
         # Build shared base image with dependencies (no instance-specific scripts)
         # Scripts will be uploaded to sandbox after creation
         return (
-            Image(
-                python_version="python3.11",
-                base_image="ubuntu:22.04"
-            )
+            Image.from_registry("ubuntu:22.04").add_python_version("python3.11")
             .add_commands([
                 # Install system packages
                 "apt-get update && apt-get install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata",
