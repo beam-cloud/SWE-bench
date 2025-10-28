@@ -22,7 +22,7 @@ LOCAL_SANDBOX_ENTRYPOINT_PATH = (
 ).resolve()
 REMOTE_SANDBOX_ENTRYPOINT_PATH = f"/workspace/{SANDBOX_ENTRYPOINT}.py"
 
-swebench_image = Image().add_python_packages(["beam-client>=0.2.189", "swebench", "tenacity"])
+swebench_image = Image().add_python_packages(["swebench", "tenacity"])
 
 SANDBOX_TIMEOUT = 60 * 30
 
@@ -110,7 +110,7 @@ class BeamSandboxRuntime:
             # Default 30 minutes
             timeout = SANDBOX_TIMEOUT
 
-        sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=6)
+        sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1)
 
         sandbox = sb.create()
 
