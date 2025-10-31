@@ -86,7 +86,7 @@ python -m swebench.harness.run_evaluation \
     # use --predictions_path 'gold' to verify the gold patches
     # use --run_id to name the evaluation run
     # use --modal true to run on Modal
-    # use --beta9 true to run on Beam
+    # use --beam true to run on Beam
 ```
 
 This command will generate docker build logs (`logs/build_images`) and evaluation logs (`logs/run_evaluation`) in the current directory.

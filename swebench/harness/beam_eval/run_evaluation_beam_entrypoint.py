@@ -1,6 +1,6 @@
-# Sandbox entrypoint script for running evals on Beta9.
+# Sandbox entrypoint script for running evals on Beam.
 #
-# In a perfect world, we would execute commands using the Sandbox directly, but Beta9 imposes
+# In a perfect world, we would execute commands using the Sandbox directly, but Beam imposes
 # a container stdio rate limit of 64 KiB/s. Some test harnesses exceed this limit which leads
 # to "dropped container output" logs that interfere with parsing the test output. Instead,
 # we mount and run this script in the Sandbox to control the rate at which stdio is streamed to

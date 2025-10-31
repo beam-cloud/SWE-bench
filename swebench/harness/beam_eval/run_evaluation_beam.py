@@ -1,4 +1,4 @@
-# This file contains logic for running evaluations on Beta9: <https://github.com/beam-cloud/beta9>.
+# This file contains logic for running evaluations on Beam: <https://github.com/beam-cloud/beta9>.
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from swebench.harness.reporting import make_run_report
 from swebench.harness.utils import EvaluationError
 from typing import cast
 
-SANDBOX_ENTRYPOINT = "run_evaluation_beta9_entrypoint"
+SANDBOX_ENTRYPOINT = "run_evaluation_beam_entrypoint"
 LOCAL_SANDBOX_ENTRYPOINT_PATH = (
     Path(__file__).parent / f"{SANDBOX_ENTRYPOINT}.py"
 ).resolve()
@@ -46,9 +46,9 @@ class TestOutput:
     errored: bool
 
 
-class Beta9SandboxRuntime:
+class BeamSandboxRuntime:
     """
-    Runtime for running instances in a Beta9 Sandbox.
+    Runtime for running instances in a Beam Sandbox.
     """
 
     def __init__(
@@ -57,7 +57,7 @@ class Beta9SandboxRuntime:
         self.test_spec = test_spec
         self.verbose = verbose
 
-        self.image = Beta9SandboxRuntime.get_instance_image(test_spec)
+        self.image = BeamSandboxRuntime.get_instance_image(test_spec)
         self.sandbox = self._get_sandbox(timeout)
 
         # Upload and execute setup scripts
@@ -85,7 +85,7 @@ class Beta9SandboxRuntime:
         # Run env setup script
         output, returncode = self.exec("/bin/bash -c 'source ~/.bashrc && /workspace/setup_env.sh'")
         if returncode != 0:
-            print(f"[Beta9] Warning: env setup script failed with code {returncode}")
+            print(f"[Beam] Warning: env setup script failed with code {returncode}")
             if self.verbose:
                 print(output)
 
@@ -95,7 +95,7 @@ class Beta9SandboxRuntime:
         # Run repo setup script
         output, returncode = self.exec("/bin/bash /workspace/setup_repo.sh")
         if returncode != 0:
-            print(f"[Beta9] Warning: repo setup script failed with code {returncode}")
+            print(f"[Beam] Warning: repo setup script failed with code {returncode}")
             if self.verbose:
                 print(output)
 
@@ -111,7 +111,6 @@ class Beta9SandboxRuntime:
             timeout = SANDBOX_TIMEOUT
 
         sb = Sandbox(image=self.image, keep_warm_seconds=timeout, cpu=1)
-        sb.image.ignore_python = False
 
         sandbox = sb.create()
 
@@ -123,7 +122,7 @@ class Beta9SandboxRuntime:
         return sandbox
 
     def write_file(self, file_path: str, content: str):
-        """Write content to a file in the sandbox using Beta9's file system API."""
+        """Write content to a file in the sandbox using Beam's file system API."""
         import tempfile
         import os
 
@@ -137,26 +136,26 @@ class Beta9SandboxRuntime:
 
     def exec(self, command: str) -> tuple[str, int]:
         """
-        Execute a command in the sandbox using Beta9's process manager.
+        Execute a command in the sandbox using Beam's process manager.
 
         Returns:
             tuple[str, int]: Sandbox output and return code.
         """
-        # Execute command via Beta9's process manager
+        # Execute command via Beam's process manager
         if self.verbose:
-            print(f"[Beta9] Executing command: {command[:100]}...")
+            print(f"[Beam] Executing command: {command[:100]}...")
         p = self.sandbox.process.exec("python3", "-m", SANDBOX_ENTRYPOINT, command) # TODO: Use python3 instead of the full path
 
         # Wait for process to complete
         if self.verbose:
-            print(f"[Beta9] Waiting for command to complete...")
+            print(f"[Beam] Waiting for command to complete...")
         exit_code = p.wait()
 
         # Read all output at once using the logs stream
         output = p.logs.read()
 
         if self.verbose:
-            print(f"[Beta9] Command completed with exit code: {exit_code}")
+            print(f"[Beam] Command completed with exit code: {exit_code}")
             if output:
                 print(output)
 
@@ -174,10 +173,7 @@ class Beta9SandboxRuntime:
         # Build shared base image with dependencies (no instance-specific scripts)
         # Scripts will be uploaded to sandbox after creation
         return (
-            Image(
-                python_version="python3.11",
-                base_image="ubuntu:22.04"
-            )
+            Image.from_registry("ubuntu:22.04").add_python_version("python3.11")
             .add_commands([
                 # Install system packages
                 "apt-get update && apt-get install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata",
@@ -204,7 +200,7 @@ def get_log_dir(pred: dict, run_id: str, instance_id: str) -> Path:
     image=swebench_image,
     timeout=120 * 60,  # Much larger than default timeout to account for image build time
 )
-def run_instance_beta9(
+def run_instance_beam(
     test_spec: TestSpec,
     pred: dict,
     run_id: str,
@@ -221,7 +217,7 @@ def run_instance_beta9(
     """
     instance_id = test_spec.instance_id
     print(f"\n{'='*80}")
-    print(f"[Beta9] Starting evaluation for {instance_id}")
+    print(f"[Beam] Starting evaluation for {instance_id}")
     print(f"{'='*80}\n")
 
     log_dir = get_log_dir(pred, run_id, instance_id)
@@ -232,7 +228,7 @@ def run_instance_beta9(
     logger = setup_logger(instance_id, log_file, add_stdout=True)
 
     try:
-        runner = Beta9SandboxRuntime(test_spec, timeout)
+        runner = BeamSandboxRuntime(test_spec, timeout)
     except Exception as e:
         print(f"Error creating sandbox: {e}")
         raise EvaluationError(
@@ -337,7 +333,7 @@ def run_instance_beta9(
     except EvaluationError:
         error_msg = traceback.format_exc()
         logger.info(error_msg)
-        print(f"[Beta9] ✗ Evaluation error for {instance_id}")
+        print(f"[Beam] ✗ Evaluation error for {instance_id}")
         print(f"{'='*80}\n")
         return TestOutput(
             instance_id=instance_id,
@@ -355,7 +351,7 @@ def run_instance_beta9(
             f"Check ({logger.log_file}) for more information."
         )
         logger.error(error_msg)
-        print(f"[Beta9] ✗ Exception occurred for {instance_id}: {e}")
+        print(f"[Beam] ✗ Exception occurred for {instance_id}: {e}")
         print(f"{'='*80}\n")
         return TestOutput(
             instance_id=instance_id,
@@ -368,7 +364,7 @@ def run_instance_beta9(
         )
 
 
-def run_instances_beta9(
+def run_instances_beam(
     predictions: dict,
     instances: list,
     full_dataset: list,
@@ -376,7 +372,7 @@ def run_instances_beta9(
     timeout: int,
 ):
     """
-    Run all instances for the given predictions on Beta9.
+    Run all instances for the given predictions on Beam.
 
     Args:
         predictions (dict): Predictions dict generated by the model
@@ -384,8 +380,8 @@ def run_instances_beta9(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
     """
-    print(f"\n[Beta9] Starting Beta9 evaluation run: {run_id}")
-    print(f"[Beta9] Total instances in dataset: {len(instances)}")
+    print(f"\n[Beam] Starting Beam evaluation run: {run_id}")
+    print(f"[Beam] Total instances in dataset: {len(instances)}")
 
     test_specs = list(map(make_test_spec, instances))
 
@@ -413,8 +409,8 @@ def run_instances_beta9(
         ]
 
         # Run instances that haven't been run yet
-        # Beta9's .map() takes an iterable and passes each element to the function
-        results = list(run_instance_beta9.map(args_list))
+        # Beam's .map() takes an iterable and passes each element to the function
+        results = list(run_instance_beam.map(args_list))
 
         for result in results:
             if result is None or isinstance(result, Exception):
